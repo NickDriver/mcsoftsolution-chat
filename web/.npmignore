@@ -1,0 +1,11 @@
+# Don't ship dev-only files when used as a `file:` or `npm pack` dep.
+# Critically, `node_modules/` would otherwise get copied wholesale into
+# consumers, dragging duplicate copies of React/react-dom/lucide-react
+# along with it — causing "Invalid hook call" / white-screen issues.
+node_modules/
+src/
+tsconfig.json
+package-lock.json
+.eslintrc*
+.prettierrc*
+*.tsbuildinfo

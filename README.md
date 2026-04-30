@@ -156,6 +156,23 @@ All copy is overridable via props:
 />
 ```
 
+### Heads-up: dedupe React in your Vite config
+
+If you install via `file:` or `link:` while developing, npm may copy the package's nested `node_modules/` (with its own copies of `react`, `react-dom`, `lucide-react`) into your consumer tree. Two copies of React in the same app trigger an "Invalid hook call" runtime error and you'll see a **white screen**.
+
+The package ships a `.npmignore` that prevents this for `npm pack` flows, but `file:`/`link:` linking can still copy stray dev artifacts. Defense in depth — add this to your consumer's `vite.config.ts`:
+
+```ts
+export default defineConfig({
+  resolve: {
+    dedupe: ["react", "react-dom", "lucide-react"],
+  },
+  // ...
+});
+```
+
+After adding, reinstall (`rm -rf node_modules && npm install`) and rebuild.
+
 ### Styling
 
 Themed via CSS custom properties. The defaults are MC Soft's red/black/cream palette. To override, declare the vars at any selector that contains the widget's root:

@@ -416,31 +416,50 @@ function AssistantBubble({
 }
 
 /**
- * Split text into nodes, rendering http(s) URLs as anchor tags. Trailing
- * punctuation stays as plain text so a link doesn't pull the period from
- * the surrounding sentence.
+ * Split text into nodes, rendering markdown links `[label](url)` and bare
+ * http(s) URLs as anchor tags. Trailing punctuation on bare URLs stays as
+ * plain text so a link doesn't pull the period from the surrounding sentence.
  */
 function linkify(text: string): ReactNode[] {
-  const urlPattern = /(https?:\/\/[^\s<>"]+)/g;
+  const pattern =
+    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>"]+)/g;
   const out: ReactNode[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
   let i = 0;
-  while ((m = urlPattern.exec(text)) !== null) {
+  while ((m = pattern.exec(text)) !== null) {
     const start = m.index;
-    let url = m[0];
-    let trail = "";
-    while (url.length > 0 && /[.,!?;:)\]]/.test(url[url.length - 1])) {
-      trail = url[url.length - 1] + trail;
-      url = url.slice(0, -1);
-    }
     if (start > last) out.push(text.slice(last, start));
-    out.push(
-      <a key={`lnk-${i++}`} href={url} target="_blank" rel="noreferrer">
-        {url}
-      </a>,
-    );
-    if (trail) out.push(trail);
+    if (m[1] && m[2]) {
+      out.push(
+        <a
+          key={`lnk-${i++}`}
+          href={m[2]}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          {m[1]}
+        </a>,
+      );
+    } else if (m[3]) {
+      let url = m[3];
+      let trail = "";
+      while (url.length > 0 && /[.,!?;:)\]]/.test(url[url.length - 1])) {
+        trail = url[url.length - 1] + trail;
+        url = url.slice(0, -1);
+      }
+      out.push(
+        <a
+          key={`lnk-${i++}`}
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          {url}
+        </a>,
+      );
+      if (trail) out.push(trail);
+    }
     last = start + m[0].length;
   }
   if (last < text.length) out.push(text.slice(last));
