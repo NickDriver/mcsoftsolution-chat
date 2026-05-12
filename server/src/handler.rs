@@ -77,9 +77,11 @@ struct StatusBody {
 }
 
 async fn status_handler(State(state): State<ServiceState>) -> Json<StatusBody> {
-    Json(StatusBody {
-        enabled: state.inner.is_some(),
-    })
+    let enabled = match &state.inner {
+        Some(svc) => svc.config.resolve_key().await.is_some(),
+        None => false,
+    };
+    Json(StatusBody { enabled })
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +108,15 @@ async fn chat_handler(
     Json(req): Json<ChatRequestBody>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let Some(svc) = state.inner else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Chat is not configured on this server.".to_string(),
+        ));
+    };
+
+    // Resolve the API key per request so dynamic resolvers (e.g. backed by
+    // an encrypted credentials store) can rotate without a restart.
+    let Some(api_key) = svc.config.resolve_key().await else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "Chat is not configured on this server.".to_string(),
@@ -157,12 +168,13 @@ async fn chat_handler(
         }
     }
 
-    let stream = run_agent_stream(svc, messages, openai_tools);
+    let stream = run_agent_stream(svc, api_key, messages, openai_tools);
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
 }
 
 fn run_agent_stream(
     svc: Arc<ServiceInner>,
+    api_key: String,
     initial_messages: Vec<Message>,
     tool_defs: Vec<Value>,
 ) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
@@ -171,7 +183,7 @@ fn run_agent_stream(
 
         for iteration in 0..MAX_TOOL_ITERATIONS {
             let req = ChatRequest {
-                api_key: svc.config.openrouter_api_key.clone(),
+                api_key: api_key.clone(),
                 model: svc.config.model.clone(),
                 messages: messages.clone(),
                 tools: tool_defs.clone(),
