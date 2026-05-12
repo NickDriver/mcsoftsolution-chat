@@ -4,17 +4,36 @@
 //! - [`ChatConfig::from_env`] — pulls from `MCSOFT_OPENROUTER_API_KEY`,
 //!   `MCSOFT_CHAT_MODEL`, `MCSOFT_MCP_URL`, `MCSOFT_SITE_LABEL`. Returns
 //!   `None` if the API key is unset.
-//! - [`ChatConfig::builder`] — explicit, programmatic.
+//! - [`ChatConfig::builder`] — explicit, programmatic. Accepts either a
+//!   static API key via [`ChatConfigBuilder::openrouter_api_key`] or a
+//!   dynamic resolver via [`ChatConfigBuilder::key_provider`] (read fresh
+//!   each request — useful when the key lives in a rotating secrets store).
 
 use std::env;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 const DEFAULT_MODEL: &str = "google/gemma-4-26b-a4b-it";
 const DEFAULT_MCP_URL: &str = "https://mcsoftsolution.com/mcp";
 
-/// Runtime configuration. Cheap to clone (all fields are owned strings).
-#[derive(Debug, Clone)]
+/// Async function returning the current OpenRouter API key, or `None` if
+/// unset. Called once per `/api/mcsoft-chat` request — keep it cheap (a
+/// cached DB read is fine; a network round-trip is not).
+pub type KeyProvider = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Runtime configuration. Cheap to clone (all owned fields).
+#[derive(Clone)]
 pub struct ChatConfig {
+    /// Static API key. Used when `key_provider` is `None`.
     pub openrouter_api_key: String,
+    /// Optional dynamic resolver. When set, takes precedence over
+    /// `openrouter_api_key` and is awaited fresh on every request.
+    pub key_provider: Option<KeyProvider>,
     pub model: String,
     pub mcp_url: String,
     /// Label used in the default system prompt to identify the surface the
@@ -23,6 +42,25 @@ pub struct ChatConfig {
     /// Full system prompt override. When `Some`, replaces the default
     /// entirely (the live tool list is still appended at the end).
     pub system_prompt_override: Option<String>,
+}
+
+impl std::fmt::Debug for ChatConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatConfig")
+            .field(
+                "openrouter_api_key",
+                &if self.openrouter_api_key.is_empty() { "<empty>" } else { "<redacted>" },
+            )
+            .field("key_provider", &self.key_provider.as_ref().map(|_| "<fn>"))
+            .field("model", &self.model)
+            .field("mcp_url", &self.mcp_url)
+            .field("site_label", &self.site_label)
+            .field(
+                "system_prompt_override",
+                &self.system_prompt_override.as_ref().map(|_| "<set>"),
+            )
+            .finish()
+    }
 }
 
 impl ChatConfig {
@@ -37,6 +75,7 @@ impl ChatConfig {
         let key = env::var("MCSOFT_OPENROUTER_API_KEY").ok().filter(|k| !k.is_empty())?;
         Some(Self {
             openrouter_api_key: key,
+            key_provider: None,
             model: env::var("MCSOFT_CHAT_MODEL")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -49,11 +88,24 @@ impl ChatConfig {
             system_prompt_override: None,
         })
     }
+
+    /// Resolve the API key for the current request. Awaits the provider
+    /// when set; otherwise returns the static key (or `None` if empty).
+    pub async fn resolve_key(&self) -> Option<String> {
+        if let Some(provider) = &self.key_provider {
+            provider().await
+        } else if !self.openrouter_api_key.is_empty() {
+            Some(self.openrouter_api_key.clone())
+        } else {
+            None
+        }
+    }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct ChatConfigBuilder {
     openrouter_api_key: Option<String>,
+    key_provider: Option<KeyProvider>,
     model: Option<String>,
     mcp_url: Option<String>,
     site_label: Option<String>,
@@ -65,6 +117,18 @@ impl ChatConfigBuilder {
         self.openrouter_api_key = Some(key.into());
         self
     }
+
+    /// Install a dynamic key resolver. Takes precedence over the static
+    /// key. Called fresh on every chat request — keep it fast.
+    pub fn key_provider<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<String>> + Send + 'static,
+    {
+        self.key_provider = Some(Arc::new(move || Box::pin(f())));
+        self
+    }
+
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
         self
@@ -82,13 +146,16 @@ impl ChatConfigBuilder {
         self
     }
 
-    /// Build the config. Panics if no OpenRouter key was provided — call
-    /// [`ChatConfig::from_env`] if you want a graceful "disabled" path.
+    /// Build the config. Panics if neither a static `openrouter_api_key`
+    /// nor a `key_provider` was supplied — there must be *some* path to
+    /// an API key, even if it currently returns `None`.
     pub fn build(self) -> ChatConfig {
+        if self.openrouter_api_key.is_none() && self.key_provider.is_none() {
+            panic!("ChatConfigBuilder: openrouter_api_key or key_provider is required");
+        }
         ChatConfig {
-            openrouter_api_key: self
-                .openrouter_api_key
-                .expect("ChatConfigBuilder: openrouter_api_key is required"),
+            openrouter_api_key: self.openrouter_api_key.unwrap_or_default(),
+            key_provider: self.key_provider,
             model: self.model.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
             mcp_url: self.mcp_url.unwrap_or_else(|| DEFAULT_MCP_URL.to_string()),
             site_label: self.site_label,
