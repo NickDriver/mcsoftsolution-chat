@@ -3,7 +3,7 @@ import { Loader2, Send, Sparkles, X } from "lucide-react";
 
 import {
   type McSoftTranscriptEntry,
-  isMcSoftChatEnabled,
+  fetchMcSoftChatConfig,
   streamMcSoftChat,
 } from "./stream";
 import { ensureStylesInjected } from "./styles";
@@ -50,19 +50,21 @@ export interface Props {
 let nextId = 0;
 const newId = () => `mc${++nextId}`;
 
+// Last-resort fallbacks if the server returns no suggestions. The live lists
+// come from the DB-versioned chat prompt (served via /api/mcsoft-chat/status).
 const DEFAULT_STARTERS = [
-  "What does MC Soft Solution actually do?",
-  "How would you build something like this for us?",
-  "What's the pricing for a starter sprint?",
+  "What could custom software do for my business?",
+  "How much would a booking system cost?",
+  "Can you show me an example you've built?",
 ];
 
 const DEFAULT_FOLLOWUPS = [
-  "What's the price for a starter sprint?",
-  "How long would a project like this take?",
-  "What's a 'private pilot'?",
+  "How much for my type of business?",
+  "How long would it take?",
+  "What would I actually own?",
+  "Do I pay monthly fees?",
+  "Can I see a real example?",
   "How do we get started?",
-  "Can I see other things you've built?",
-  "How does the MCP integration actually work?",
 ];
 
 const DEFAULT_INTRO =
@@ -96,6 +98,10 @@ export function McSoftChatWidget({
   const [bubbles, setBubbles] = useState<Bubble[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
+  // Server-driven suggestion lists (DB-versioned). `null` until fetched; an
+  // empty server list leaves these null so the prop/built-in defaults win.
+  const [remoteStarters, setRemoteStarters] = useState<string[] | null>(null);
+  const [remoteFollowups, setRemoteFollowups] = useState<string[] | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -105,8 +111,11 @@ export function McSoftChatWidget({
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    void isMcSoftChatEnabled(apiBase).then((v) => {
-      if (!cancelled) setEnabled(v);
+    void fetchMcSoftChatConfig(apiBase).then((cfg) => {
+      if (cancelled) return;
+      setEnabled(cfg.enabled);
+      if (cfg.starters.length > 0) setRemoteStarters(cfg.starters);
+      if (cfg.followups.length > 0) setRemoteFollowups(cfg.followups);
     });
     return () => {
       cancelled = true;
@@ -220,6 +229,10 @@ export function McSoftChatWidget({
     void sendMessage(text);
   };
 
+  // Precedence: server (DB-versioned) > caller prop > built-in default.
+  const starters = remoteStarters ?? starterQuestions;
+  const followups = remoteFollowups ?? followupQuestions;
+
   return (
     <div
       className="mcsoft-chat-root"
@@ -259,10 +272,10 @@ export function McSoftChatWidget({
           ) : bubbles.length === 0 ? (
             <div className="mcsoft-chat-empty">
               <p className="mcsoft-chat-empty-text">{introText}</p>
-              {starterQuestions.length > 0 && (
+              {starters.length > 0 && (
                 <div>
                   <p className="mcsoft-chat-section-label">Try one of these</p>
-                  {starterQuestions.map((q) => (
+                  {starters.map((q) => (
                     <button
                       key={q}
                       type="button"
@@ -296,7 +309,7 @@ export function McSoftChatWidget({
                   streaming={streaming}
                   showFollowups={isLast && !streaming}
                   followupTurn={assistantTurn - 1}
-                  followupBank={followupQuestions}
+                  followupBank={followups}
                   onFollowupPick={(q) => void sendMessage(q)}
                 />
               );
@@ -387,7 +400,7 @@ function AssistantBubble({
 
       {bubble.text && (
         <div className="mcsoft-chat-text">
-          {linkify(bubble.text)}
+          {renderRich(bubble.text)}
           {showCursor && <span className="mcsoft-chat-cursor">▍</span>}
         </div>
       )}
@@ -416,51 +429,70 @@ function AssistantBubble({
 }
 
 /**
- * Split text into nodes, rendering markdown links `[label](url)` and bare
- * http(s) URLs as anchor tags. Trailing punctuation on bare URLs stays as
- * plain text so a link doesn't pull the period from the surrounding sentence.
+ * Render assistant text as React nodes: `**bold**` becomes <strong>, and
+ * link-ish spans become anchors — markdown links `[label](href)` (relative or
+ * absolute), bracketed bare paths like `[ /contact ]`, bare http(s) URLs, and
+ * bare site paths (`/contact`, `/pricing`, `/case-studies`, `/blog`). Newlines
+ * are preserved by the caller's `white-space` CSS.
  */
-function linkify(text: string): ReactNode[] {
+function renderRich(text: string): ReactNode[] {
+  const out: ReactNode[] = [];
+  const boldRe = /\*\*([^*]+)\*\*/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let i = 0;
+  while ((m = boldRe.exec(text)) !== null) {
+    if (m.index > last) out.push(...linkify(text.slice(last, m.index), `t${i}`));
+    out.push(<strong key={`b${i}`}>{linkify(m[1], `s${i}`)}</strong>);
+    i++;
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(...linkify(text.slice(last), `t${i}`));
+  return out;
+}
+
+/**
+ * Turn link-ish spans within a plain-text run into anchors. Relative hrefs
+ * (same-site, e.g. `/contact`) open in place; absolute URLs open in a new tab.
+ * Trailing punctuation on bare URLs stays as text so the link doesn't swallow a
+ * sentence's period.
+ */
+function linkify(text: string, keyPrefix: string): ReactNode[] {
   const pattern =
-    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>"]+)/g;
+    /\[([^\]]+)\]\(\s*([^\s)]+)\s*\)|\[\s*(\/[A-Za-z0-9][\w/-]*)\s*\]|(https?:\/\/[^\s<>"]+)|(\/(?:contact|pricing|case-studies|blog)\b)/g;
   const out: ReactNode[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
   let i = 0;
+  const anchor = (href: string, label: string) =>
+    /^https?:\/\//.test(href) ? (
+      <a key={`${keyPrefix}-${i++}`} href={href} target="_blank" rel="noopener noreferrer">
+        {label}
+      </a>
+    ) : (
+      <a key={`${keyPrefix}-${i++}`} href={href}>
+        {label}
+      </a>
+    );
   while ((m = pattern.exec(text)) !== null) {
-    const start = m.index;
-    if (start > last) out.push(text.slice(last, start));
-    if (m[1] && m[2]) {
-      out.push(
-        <a
-          key={`lnk-${i++}`}
-          href={m[2]}
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          {m[1]}
-        </a>,
-      );
-    } else if (m[3]) {
-      let url = m[3];
+    if (m.index > last) out.push(text.slice(last, m.index));
+    if (m[1] !== undefined && m[2] !== undefined) {
+      out.push(anchor(m[2], m[1])); // [label](href)
+    } else if (m[3] !== undefined) {
+      out.push(anchor(m[3], m[3])); // [ /path ] — drop the brackets
+    } else if (m[4] !== undefined) {
+      let url = m[4];
       let trail = "";
       while (url.length > 0 && /[.,!?;:)\]]/.test(url[url.length - 1])) {
         trail = url[url.length - 1] + trail;
         url = url.slice(0, -1);
       }
-      out.push(
-        <a
-          key={`lnk-${i++}`}
-          href={url}
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          {url}
-        </a>,
-      );
+      out.push(anchor(url, url)); // bare absolute URL
       if (trail) out.push(trail);
+    } else if (m[5] !== undefined) {
+      out.push(anchor(m[5], m[5])); // bare site path
     }
-    last = start + m[0].length;
+    last = m.index + m[0].length;
   }
   if (last < text.length) out.push(text.slice(last));
   return out;

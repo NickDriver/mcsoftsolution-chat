@@ -131,3 +131,33 @@ export async function isMcSoftChatEnabled(apiBase = ""): Promise<boolean> {
     return false;
   }
 }
+
+export interface McSoftChatConfig {
+  enabled: boolean;
+  /** DB-driven starter prompts; empty => caller falls back to its own defaults. */
+  starters: string[];
+  /** DB-driven suggested follow-ups; empty => caller uses its own defaults. */
+  followups: string[];
+}
+
+/**
+ * Fetch the widget config from `/api/mcsoft-chat/status`: whether chat is
+ * enabled, plus the server-driven starter + follow-up suggestion lists. Lists
+ * come back empty when the server has none configured.
+ */
+export async function fetchMcSoftChatConfig(
+  apiBase = "",
+): Promise<McSoftChatConfig> {
+  try {
+    const r = await fetch(`${apiBase}/api/mcsoft-chat/status`);
+    if (!r.ok) return { enabled: false, starters: [], followups: [] };
+    const j = (await r.json()) as Partial<McSoftChatConfig>;
+    return {
+      enabled: Boolean(j.enabled),
+      starters: Array.isArray(j.starters) ? j.starters : [],
+      followups: Array.isArray(j.followups) ? j.followups : [],
+    };
+  } catch {
+    return { enabled: false, starters: [], followups: [] };
+  }
+}

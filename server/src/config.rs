@@ -36,6 +36,15 @@ pub type PromptProvider = Arc<
         + Sync,
 >;
 
+/// Async function returning the widget's `(starters, followups)` suggestion
+/// lists. Called once per `/api/mcsoft-chat/status` request — keep it cheap (a
+/// cached DB read is fine). Empty lists mean the widget uses its own defaults.
+pub type SuggestionsProvider = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = (Vec<String>, Vec<String>)> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Runtime configuration. Cheap to clone (all owned fields).
 #[derive(Clone)]
 pub struct ChatConfig {
@@ -57,6 +66,9 @@ pub struct ChatConfig {
     /// takes precedence over `system_prompt_override` and is awaited fresh on
     /// every request.
     pub prompt_provider: Option<PromptProvider>,
+    /// Optional resolver for the widget's starter/follow-up suggestions,
+    /// awaited fresh on each `/status` request.
+    pub suggestions_provider: Option<SuggestionsProvider>,
 }
 
 impl std::fmt::Debug for ChatConfig {
@@ -75,6 +87,7 @@ impl std::fmt::Debug for ChatConfig {
                 &self.system_prompt_override.as_ref().map(|_| "<set>"),
             )
             .field("prompt_provider", &self.prompt_provider.as_ref().map(|_| "<fn>"))
+            .field("suggestions_provider", &self.suggestions_provider.as_ref().map(|_| "<fn>"))
             .finish()
     }
 }
@@ -103,6 +116,7 @@ impl ChatConfig {
             site_label: env::var("MCSOFT_SITE_LABEL").ok().filter(|s| !s.is_empty()),
             system_prompt_override: None,
             prompt_provider: None,
+            suggestions_provider: None,
         })
     }
 
@@ -113,6 +127,17 @@ impl ChatConfig {
             provider().await
         } else {
             self.system_prompt_override.clone()
+        }
+    }
+
+    /// Resolve the widget's `(starters, followups)` for the current request.
+    /// Returns empty lists when no provider is installed (the widget then falls
+    /// back to its own built-in defaults).
+    pub async fn resolve_suggestions(&self) -> (Vec<String>, Vec<String>) {
+        if let Some(provider) = &self.suggestions_provider {
+            provider().await
+        } else {
+            (Vec::new(), Vec::new())
         }
     }
 
@@ -138,6 +163,7 @@ pub struct ChatConfigBuilder {
     site_label: Option<String>,
     system_prompt_override: Option<String>,
     prompt_provider: Option<PromptProvider>,
+    suggestions_provider: Option<SuggestionsProvider>,
 }
 
 impl ChatConfigBuilder {
@@ -186,6 +212,17 @@ impl ChatConfigBuilder {
         self
     }
 
+    /// Install a dynamic resolver for the widget's starter/follow-up
+    /// suggestions. Called fresh on each `/status` request — keep it fast.
+    pub fn suggestions_provider<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = (Vec<String>, Vec<String>)> + Send + 'static,
+    {
+        self.suggestions_provider = Some(Arc::new(move || Box::pin(f())));
+        self
+    }
+
     /// Build the config. Panics if neither a static `openrouter_api_key`
     /// nor a `key_provider` was supplied — there must be *some* path to
     /// an API key, even if it currently returns `None`.
@@ -201,6 +238,7 @@ impl ChatConfigBuilder {
             site_label: self.site_label,
             system_prompt_override: self.system_prompt_override,
             prompt_provider: self.prompt_provider,
+            suggestions_provider: self.suggestions_provider,
         }
     }
 }

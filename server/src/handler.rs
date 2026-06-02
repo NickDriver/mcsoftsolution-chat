@@ -74,14 +74,21 @@ struct TranscriptEntry {
 #[derive(Debug, Serialize)]
 struct StatusBody {
     enabled: bool,
+    /// Empty-state starter prompts; empty => widget uses its own defaults.
+    starters: Vec<String>,
+    /// Suggested follow-up chips; empty => widget uses its own defaults.
+    followups: Vec<String>,
 }
 
 async fn status_handler(State(state): State<ServiceState>) -> Json<StatusBody> {
-    let enabled = match &state.inner {
-        Some(svc) => svc.config.resolve_key().await.is_some(),
-        None => false,
-    };
-    Json(StatusBody { enabled })
+    match &state.inner {
+        Some(svc) => {
+            let enabled = svc.config.resolve_key().await.is_some();
+            let (starters, followups) = svc.config.resolve_suggestions().await;
+            Json(StatusBody { enabled, starters, followups })
+        }
+        None => Json(StatusBody { enabled: false, starters: Vec::new(), followups: Vec::new() }),
+    }
 }
 
 #[derive(Debug, Serialize)]
