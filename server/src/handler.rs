@@ -154,9 +154,13 @@ async fn chat_handler(
 
     let openai_tools: Vec<Value> = mcp_tools.iter().map(mcp_tool_to_openai).collect();
 
+    // Resolve the prompt override per request so a DB-backed provider can pick
+    // up published edits without a restart (mirrors the key-provider pattern).
+    let prompt_override = svc.config.resolve_prompt_override().await;
+
     let mut messages: Vec<Message> = Vec::with_capacity(req.history.len() + 1);
     messages.push(Message::system(prompt::build(
-        svc.config.system_prompt_override.as_deref(),
+        prompt_override.as_deref(),
         svc.config.site_label.as_deref(),
         &mcp_tools,
     )));
