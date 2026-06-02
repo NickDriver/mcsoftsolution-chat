@@ -26,6 +26,25 @@ pub type KeyProvider = Arc<
         + Sync,
 >;
 
+/// Async function returning the current full system-prompt override, or `None`
+/// to fall back to the default body. Called once per `/api/mcsoft-chat`
+/// request — keep it cheap (a cached DB read is fine; a network round-trip is
+/// not). Lets the prompt live in an editable store and update without a restart.
+pub type PromptProvider = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Async function returning the widget's `(starters, followups)` suggestion
+/// lists. Called once per `/api/mcsoft-chat/status` request — keep it cheap (a
+/// cached DB read is fine). Empty lists mean the widget uses its own defaults.
+pub type SuggestionsProvider = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = (Vec<String>, Vec<String>)> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Runtime configuration. Cheap to clone (all owned fields).
 #[derive(Clone)]
 pub struct ChatConfig {
@@ -40,8 +59,16 @@ pub struct ChatConfig {
     /// visitor is chatting from (e.g. `"franchise-match-ai"`).
     pub site_label: Option<String>,
     /// Full system prompt override. When `Some`, replaces the default
-    /// entirely (the live tool list is still appended at the end).
+    /// entirely (the live tool list is still appended at the end). Used when
+    /// `prompt_provider` is `None`.
     pub system_prompt_override: Option<String>,
+    /// Optional dynamic resolver for the system-prompt override. When set,
+    /// takes precedence over `system_prompt_override` and is awaited fresh on
+    /// every request.
+    pub prompt_provider: Option<PromptProvider>,
+    /// Optional resolver for the widget's starter/follow-up suggestions,
+    /// awaited fresh on each `/status` request.
+    pub suggestions_provider: Option<SuggestionsProvider>,
 }
 
 impl std::fmt::Debug for ChatConfig {
@@ -59,6 +86,8 @@ impl std::fmt::Debug for ChatConfig {
                 "system_prompt_override",
                 &self.system_prompt_override.as_ref().map(|_| "<set>"),
             )
+            .field("prompt_provider", &self.prompt_provider.as_ref().map(|_| "<fn>"))
+            .field("suggestions_provider", &self.suggestions_provider.as_ref().map(|_| "<fn>"))
             .finish()
     }
 }
@@ -86,7 +115,30 @@ impl ChatConfig {
                 .unwrap_or_else(|| DEFAULT_MCP_URL.to_string()),
             site_label: env::var("MCSOFT_SITE_LABEL").ok().filter(|s| !s.is_empty()),
             system_prompt_override: None,
+            prompt_provider: None,
+            suggestions_provider: None,
         })
+    }
+
+    /// Resolve the system-prompt override for the current request. Awaits the
+    /// provider when set; otherwise returns the static override (or `None`).
+    pub async fn resolve_prompt_override(&self) -> Option<String> {
+        if let Some(provider) = &self.prompt_provider {
+            provider().await
+        } else {
+            self.system_prompt_override.clone()
+        }
+    }
+
+    /// Resolve the widget's `(starters, followups)` for the current request.
+    /// Returns empty lists when no provider is installed (the widget then falls
+    /// back to its own built-in defaults).
+    pub async fn resolve_suggestions(&self) -> (Vec<String>, Vec<String>) {
+        if let Some(provider) = &self.suggestions_provider {
+            provider().await
+        } else {
+            (Vec::new(), Vec::new())
+        }
     }
 
     /// Resolve the API key for the current request. Awaits the provider
@@ -110,6 +162,8 @@ pub struct ChatConfigBuilder {
     mcp_url: Option<String>,
     site_label: Option<String>,
     system_prompt_override: Option<String>,
+    prompt_provider: Option<PromptProvider>,
+    suggestions_provider: Option<SuggestionsProvider>,
 }
 
 impl ChatConfigBuilder {
@@ -146,6 +200,29 @@ impl ChatConfigBuilder {
         self
     }
 
+    /// Install a dynamic system-prompt resolver. Takes precedence over the
+    /// static override. Called fresh on every chat request — keep it fast
+    /// (a cached DB read is fine).
+    pub fn prompt_provider<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<String>> + Send + 'static,
+    {
+        self.prompt_provider = Some(Arc::new(move || Box::pin(f())));
+        self
+    }
+
+    /// Install a dynamic resolver for the widget's starter/follow-up
+    /// suggestions. Called fresh on each `/status` request — keep it fast.
+    pub fn suggestions_provider<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = (Vec<String>, Vec<String>)> + Send + 'static,
+    {
+        self.suggestions_provider = Some(Arc::new(move || Box::pin(f())));
+        self
+    }
+
     /// Build the config. Panics if neither a static `openrouter_api_key`
     /// nor a `key_provider` was supplied — there must be *some* path to
     /// an API key, even if it currently returns `None`.
@@ -160,6 +237,8 @@ impl ChatConfigBuilder {
             mcp_url: self.mcp_url.unwrap_or_else(|| DEFAULT_MCP_URL.to_string()),
             site_label: self.site_label,
             system_prompt_override: self.system_prompt_override,
+            prompt_provider: self.prompt_provider,
+            suggestions_provider: self.suggestions_provider,
         }
     }
 }

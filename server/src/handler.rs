@@ -74,14 +74,21 @@ struct TranscriptEntry {
 #[derive(Debug, Serialize)]
 struct StatusBody {
     enabled: bool,
+    /// Empty-state starter prompts; empty => widget uses its own defaults.
+    starters: Vec<String>,
+    /// Suggested follow-up chips; empty => widget uses its own defaults.
+    followups: Vec<String>,
 }
 
 async fn status_handler(State(state): State<ServiceState>) -> Json<StatusBody> {
-    let enabled = match &state.inner {
-        Some(svc) => svc.config.resolve_key().await.is_some(),
-        None => false,
-    };
-    Json(StatusBody { enabled })
+    match &state.inner {
+        Some(svc) => {
+            let enabled = svc.config.resolve_key().await.is_some();
+            let (starters, followups) = svc.config.resolve_suggestions().await;
+            Json(StatusBody { enabled, starters, followups })
+        }
+        None => Json(StatusBody { enabled: false, starters: Vec::new(), followups: Vec::new() }),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -154,9 +161,13 @@ async fn chat_handler(
 
     let openai_tools: Vec<Value> = mcp_tools.iter().map(mcp_tool_to_openai).collect();
 
+    // Resolve the prompt override per request so a DB-backed provider can pick
+    // up published edits without a restart (mirrors the key-provider pattern).
+    let prompt_override = svc.config.resolve_prompt_override().await;
+
     let mut messages: Vec<Message> = Vec::with_capacity(req.history.len() + 1);
     messages.push(Message::system(prompt::build(
-        svc.config.system_prompt_override.as_deref(),
+        prompt_override.as_deref(),
         svc.config.site_label.as_deref(),
         &mcp_tools,
     )));
