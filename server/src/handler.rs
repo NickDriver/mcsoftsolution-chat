@@ -25,6 +25,26 @@ use crate::openrouter::{
 };
 use crate::prompt;
 
+/// Tools the public chat agent is NOT offered.
+///
+/// `get_pricing_config` returns the base hourly rate. Given that number and a
+/// project price the model will divide, and then disclose the result — "roughly
+/// 92 hours of development work" — which is exactly the internal figure the
+/// guardrail preamble forbids sharing.
+///
+/// This was reproduced against the live model, and prompt hardening did not
+/// stop it: an explicit "never derive an hours figure, do not divide a price by
+/// the hourly rate" rule was added to the preamble and the very next answer
+/// derived the hours anyway. A rule cannot beat a number that is already
+/// sitting in the context window, so the number is withheld instead. Nothing is
+/// lost — `get_recipe` and `estimate_project` return dollar figures with the
+/// discount already applied, and `list_pricing_catalog` still states that a
+/// discount is active, which is all the agent needs to say.
+///
+/// The tool stays on the public MCP server for every other consumer; it is only
+/// withheld from this agent.
+const HIDDEN_FROM_AGENT: &[&str] = &["get_pricing_config"];
+
 const MAX_TOOL_ITERATIONS: u32 = 6;
 const MAX_RESPONSE_TOKENS: u32 = 800;
 const TEMPERATURE: f32 = 0.5;
@@ -159,6 +179,8 @@ async fn chat_handler(
         }
     };
 
+    let mcp_tools = visible_to_agent(mcp_tools);
+
     let openai_tools: Vec<Value> = mcp_tools.iter().map(mcp_tool_to_openai).collect();
 
     // Resolve the prompt override per request so a DB-backed provider can pick
@@ -289,15 +311,27 @@ fn run_agent_stream(
                     args: parsed_args.clone(),
                 }));
 
-                let outcome = svc.mcp.call_tool(&tc.function.name, parsed_args.clone()).await;
-                let (ok, content, summary) = match outcome {
-                    Ok(text) => {
-                        let summary = format!("returned {} chars", text.len().min(9999));
-                        (true, text, summary)
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        (false, json!({"error": msg}).to_string(), msg)
+                // The model was never offered a withheld tool, so a call to one is
+                // hallucinated or coaxed. Refuse it here rather than round-tripping
+                // to the MCP server, which keeps the withheld figure out of the
+                // transcript entirely.
+                let (ok, content, summary) = if is_hidden_from_agent(&tc.function.name) {
+                    tracing::warn!(
+                        tool = %tc.function.name,
+                        "refused a call to a tool withheld from the agent"
+                    );
+                    let msg = format!("tool '{}' is not available", tc.function.name);
+                    (false, json!({"error": msg}).to_string(), msg)
+                } else {
+                    match svc.mcp.call_tool(&tc.function.name, parsed_args.clone()).await {
+                        Ok(text) => {
+                            let summary = format!("returned {} chars", text.len().min(9999));
+                            (true, text, summary)
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            (false, json!({"error": msg}).to_string(), msg)
+                        }
                     }
                 };
                 yield Ok(tool_call_result_event(&ToolCallResultPayload {
@@ -322,6 +356,23 @@ struct PartialToolCall {
     id: String,
     name: String,
     args: String,
+}
+
+fn is_hidden_from_agent(name: &str) -> bool {
+    HIDDEN_FROM_AGENT.contains(&name)
+}
+
+/// Drop the withheld tools from a live `tools/list` result.
+///
+/// Applied once, at the boundary: the same list feeds both the tool definitions
+/// sent to the model and the tool-list appendix `prompt::build` appends to the
+/// system prompt. A withheld tool must appear in neither — naming it in the
+/// appendix would put it back in the model's context as something to ask for.
+fn visible_to_agent(tools: Vec<McpTool>) -> Vec<McpTool> {
+    tools
+        .into_iter()
+        .filter(|t| !is_hidden_from_agent(&t.name))
+        .collect()
 }
 
 fn mcp_tool_to_openai(tool: &McpTool) -> Value {
@@ -374,4 +425,59 @@ fn error_event(message: &str) -> Event {
 
 fn done_event() -> Event {
     Event::default().event("done").data("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(name: &str) -> McpTool {
+        McpTool {
+            name: name.to_string(),
+            description: format!("description of {name}"),
+            input_schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn live_tools() -> Vec<McpTool> {
+        vec![
+            tool("get_recipe"),
+            tool("get_pricing_config"),
+            tool("estimate_project"),
+            tool("list_pricing_catalog"),
+        ]
+    }
+
+    #[test]
+    fn withheld_tools_are_not_offered_to_the_model() {
+        let names: Vec<String> = visible_to_agent(live_tools())
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(
+            names,
+            ["get_recipe", "estimate_project", "list_pricing_catalog"]
+        );
+    }
+
+    /// The appendix is built from the same list, so the withheld tool must not
+    /// be named there either — that is a second way the rate re-enters context.
+    #[test]
+    fn the_system_prompt_appendix_never_names_a_withheld_tool() {
+        let system = prompt::build(
+            Some("persona body"),
+            None,
+            &visible_to_agent(live_tools()),
+        );
+        assert!(!system.contains("get_pricing_config"));
+        assert!(system.contains("get_recipe"));
+    }
+
+    /// Belt and braces: the persona still mentions the tool by name, so a model
+    /// can name it even though it was never offered.
+    #[test]
+    fn a_withheld_tool_is_refused_even_if_the_model_names_it() {
+        assert!(is_hidden_from_agent("get_pricing_config"));
+        assert!(!is_hidden_from_agent("estimate_project"));
+    }
 }
